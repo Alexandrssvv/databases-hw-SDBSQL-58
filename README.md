@@ -1,138 +1,97 @@
-# Домашнее задание к занятию «Индексы» — Сергеев Александр
+# Домашнее задание к занятию «Расширенные возможности SQL» — Сергеев Александр
 
 ## Задание 1
 
-Для расчёта использована системная таблица `information_schema.tables`.
-Учтены только таблицы учебной базы `sakila`, представления исключены.
+Одним запросом получены фамилия и имя сотрудника, город магазина
+и количество закреплённых покупателей для магазинов,
+в которых обслуживается более 300 покупателей.
 
 ```sql
 SELECT
-    SUM(data_length + index_length) AS total_size_bytes,
-    SUM(index_length) AS indexes_size_bytes,
-    ROUND(
-        SUM(index_length) * 100.0
-        / NULLIF(SUM(data_length + index_length), 0),
-        2
-    ) AS indexes_percent
-FROM information_schema.tables
-WHERE table_schema = 'sakila'
-  AND table_type = 'BASE TABLE';
+    st.last_name,
+    st.first_name,
+    ci.city,
+    COUNT(c.customer_id) AS customers_count
+FROM sakila.store s
+JOIN sakila.staff st
+    ON st.store_id = s.store_id
+JOIN sakila.customer c
+    ON c.store_id = s.store_id
+JOIN sakila.address a
+    ON a.address_id = s.address_id
+JOIN sakila.city ci
+    ON ci.city_id = a.city_id
+GROUP BY
+    s.store_id,
+    st.staff_id,
+    st.last_name,
+    st.first_name,
+    ci.city
+HAVING COUNT(c.customer_id) > 300;
 ```
 
-Процент рассчитан по формуле:
+Таблицы соединены по идентификаторам магазина, адреса и города.
+Город определён по адресу магазина.
 
-Размер индексов / (Размер данных + Размер индексов) × 100%.
+Количество покупателей рассчитано функцией `COUNT()`.
+Условие `HAVING` оставляет группы, в которых покупателей больше 300.
 
-`NULLIF()` предотвращает деление на ноль.
-Результат округляется до двух знаков после запятой.
-
-Для InnoDB значения приблизительные: `data_length` включает данные
-и кластерный индекс, а `index_length` учитывает вторичные индексы.
-Таким образом, рассчитывается доля вторичных индексов в общем
-учтённом размере таблиц.
-
-![Результат выполнения задания 1](img/Задание-4-1.png)
+![Результат выполнения задания 1](img/Задание-5-1.png)
 
 ## Задание 2
 
-### План выполнения исходного запроса
-
-Для анализа исходного запроса использован `EXPLAIN ANALYZE`.
+Получено количество фильмов, продолжительность которых больше
+средней продолжительности всех фильмов.
 
 ```sql
-EXPLAIN ANALYZE
-SELECT DISTINCT
-    CONCAT(c.last_name, ' ', c.first_name),
-    SUM(p.amount) OVER (
-        PARTITION BY c.customer_id, f.title
-    )
-FROM sakila.payment p,
-     sakila.rental r,
-     sakila.customer c,
-     sakila.inventory i,
-     sakila.film f
-WHERE DATE(p.payment_date) = '2005-07-30'
-  AND p.payment_date = r.rental_date
-  AND r.customer_id = c.customer_id
-  AND i.inventory_id = r.inventory_id;
+SELECT COUNT(*) AS films_count
+FROM sakila.film
+WHERE length > (
+    SELECT AVG(length)
+    FROM sakila.film
+);
 ```
 
-![План выполнения исходного запроса](img/Задание-4-2.png)
+Подзапрос с `AVG(length)` вычисляет среднюю продолжительность
+всех фильмов. Условие `WHERE` отбирает фильмы с продолжительностью
+выше средней, а `COUNT(*)` подсчитывает их количество.
 
-### Узкие места исходного запроса
+![Результат выполнения задания 2](img/Задание-5-2.png)
 
-1. Таблица `film` не связана с остальными таблицами условием соединения.
-   В плане присутствует `Inner hash join (no condition)`.
-   Соединение 634 платежей с 1000 фильмами формирует 634 000 строк.
+## Задание 3
 
-2. Платежи соединяются с арендой по совпадению времени:
-   `p.payment_date = r.rental_date`.
-   Это не связь по идентификатору аренды. После соединения количество
-   промежуточных строк возрастает до 642 000.
-
-3. Оконная функция требует сортировки и буферизации 642 000 строк.
-   После этого `DISTINCT` выполняет удаление дубликатов
-   с использованием временной таблицы.
-
-4. Условие `DATE(p.payment_date) = '2005-07-30'` применяет функцию
-   к колонке и не позволяет использовать обычный индекс по этой колонке
-   для поиска диапазона. В плане наблюдается полный просмотр
-   таблицы `payment`: 16 044 строки.
-
-Время выполнения исходного запроса по верхнему узлу плана —
-около 2882 мс. Получена 391 строка.
-
-### Исправление и оптимизация запроса
-
-Платежи связаны с арендой по `rental_id`, а фильмы —
-с экземплярами через `film_id`. Соединения записаны явно через `JOIN`.
-
-Фильтрация по дате заменена на полуоткрытый диапазон без функции
-над колонкой. Для получения суммы по покупателю и фильму
-используется `GROUP BY` вместо оконной функции и `DISTINCT`.
-Название фильма добавлено в вывод для наглядности.
-
-Исправление связей меняет результат исходного запроса:
-теперь сумма рассчитывается по фактически арендованным фильмам.
+Определён месяц с наибольшей суммой платежей.
+Дополнительно получено количество аренд за этот календарный месяц.
 
 ```sql
-EXPLAIN ANALYZE
 SELECT
-    CONCAT(c.last_name, ' ', c.first_name) AS customer_name,
-    f.title AS film_title,
-    SUM(p.amount) AS total_amount
-FROM sakila.payment p
-JOIN sakila.rental r
-    ON r.rental_id = p.rental_id
-JOIN sakila.customer c
-    ON c.customer_id = r.customer_id
-JOIN sakila.inventory i
-    ON i.inventory_id = r.inventory_id
-JOIN sakila.film f
-    ON f.film_id = i.film_id
-WHERE p.payment_date >= '2005-07-30'
-  AND p.payment_date < '2005-07-31'
-GROUP BY
-    c.customer_id,
-    c.last_name,
-    c.first_name,
-    f.title;
+    p.payment_month,
+    p.total_amount,
+    (
+        SELECT COUNT(*)
+        FROM sakila.rental r
+        WHERE DATE_FORMAT(r.rental_date, '%Y-%m') = p.payment_month
+    ) AS rentals_count
+FROM (
+    SELECT
+        DATE_FORMAT(payment_date, '%Y-%m') AS payment_month,
+        SUM(amount) AS total_amount
+    FROM sakila.payment
+    GROUP BY DATE_FORMAT(payment_date, '%Y-%m')
+    ORDER BY total_amount DESC, payment_month
+    LIMIT 1
+) p;
 ```
 
-![План исправленного запроса без нового индекса](img/Задание-4-3.png)
+Платежи сгруппированы по году и месяцу выполнения.
+Сумма рассчитана функцией `SUM(amount)`.
+Сортировка по убыванию суммы и `LIMIT 1` позволяют выбрать
+месяц с максимальной суммой платежей.
 
-### Результат исправления запроса
+Количество аренд рассчитано отдельным подзапросом по `rental_date`
+за тот же год и месяц.
 
-По данным `EXPLAIN ANALYZE`, время выполнения исправленного запроса
-составило около 11,2 мс, исходного — около 2882 мс.
+Наибольшая сумма платежей получена в июле 2005 года — 28 368,91.
+Количество аренд за этот месяц — 6709.
 
-Вместо 642 000 промежуточных строк соединения обрабатывают 634 строки.
-Для таблиц `rental`, `customer`, `inventory` и `film` используются
-точечные обращения по первичным ключам.
-
-Сравнение отражает исправление логики и изменение способа расчёта:
-результаты исходного и исправленного запросов различаются.
-
-В плане остался полный просмотр таблицы `payment`:
-операция `Table scan on p` читает 16 044 строки.
-Следующий шаг — проверка существующих индексов для фильтрации по дате.
+![Результат выполнения задания 3](img/Задание-5-3.png)
